@@ -1,15 +1,19 @@
 import os
 import json
 import time
+import html
 import requests
+import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from curl_cffi import requests as curl_requests
+from deep_translator import GoogleTranslator
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 HISTORY_FILE = "posted_urls.json"
 TARGET_URL = "https://www.axios.com/politics-policy"
+RSS_URL = "https://www.axios.com/feeds/feed.rss"
 
 def load_history():
     if os.path.exists(HISTORY_FILE):
@@ -23,10 +27,21 @@ def load_history():
     return []
 
 def save_history(history):
-    # Keep only the last 200 URLs to keep the JSON lightweight
-    history = history[-200:]
+    # Keep the last 300 URLs in history
+    history = history[-300:]
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
+
+def translate_to_persian(text):
+    """Translates the English headline into fluent Persian."""
+    if not text:
+        return ""
+    try:
+        translated = GoogleTranslator(source='auto', target='fa').translate(text)
+        return translated if translated else text
+    except Exception as e:
+        print(f"Translation warning: {e}")
+        return text  # Fallback to English if translation service is unreachable
 
 def send_telegram_message(text):
     api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -42,40 +57,78 @@ def send_telegram_message(text):
     except Exception as e:
         print(f"Error sending message to Telegram: {e}")
 
-def scrape_axios_politics():
-    print(f"Fetching {TARGET_URL} using browser impersonation...")
-    
-    # curl_cffi impersonates Chrome TLS fingerprint to bypass 403 blocks
-    response = curl_requests.get(
-        TARGET_URL,
-        impersonate="chrome120",
-        headers={
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        },
-        timeout=25
-    )
-    
-    if response.status_code != 200:
-        print(f"Received status code {response.status_code}")
-        return []
-
-    soup = BeautifulSoup(response.text, "html.parser")
+def fetch_from_rss():
+    """Fetches real-time chronological politics articles from Axios RSS feed."""
     articles = []
+    try:
+        print("Fetching real-time RSS feed...")
+        res = curl_requests.get(
+            RSS_URL,
+            impersonate="chrome120",
+            timeout=20
+        )
+        if res.status_code == 200:
+            root = ET.fromstring(res.content)
+            for item in root.findall("./channel/item"):
+                link = item.findtext("link", "").strip().split("?")[0]
+                title = item.findtext("title", "").strip()
+                categories = [c.text.lower() for c in item.findall("category") if c.text]
 
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        # Match story URL patterns on Axios
-        if any(k in href for k in ["/202", "/politics-policy/"]) and not href.endswith(("/politics-policy", "/newsletters", "#")):
-            full_url = urljoin(TARGET_URL, href).split("?")[0]
-            title = a.get_text(strip=True)
+                is_politics = (
+                    "politics" in link
+                    or "policy" in link
+                    or any("politic" in c or "policy" in c or "government" in c or "congress" in c or "white house" in c for c in categories)
+                )
 
-            # Ensure valid headline text
-            if title and len(title.split()) >= 4:
-                if not any(item["url"] == full_url for item in articles):
-                    articles.append({"title": title, "url": full_url})
-
+                if is_politics and link and title:
+                    articles.append({
+                        "title": title,
+                        "url": link
+                    })
+    except Exception as e:
+        print(f"RSS fetch warning: {e}")
     return articles
+
+def fetch_from_webpage():
+    """Scrapes latest chronological articles from the politics page."""
+    articles = []
+    try:
+        print(f"Fetching stream from {TARGET_URL}...")
+        res = curl_requests.get(
+            TARGET_URL,
+            impersonate="chrome120",
+            headers={"Accept-Language": "en-US,en;q=0.9"},
+            timeout=25
+        )
+        if res.status_code == 200:
+            soup = BeautifulSoup(res.text, "html.parser")
+
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if any(k in href for k in ["/202", "/politics-policy/"]) and not href.endswith(("/politics-policy", "/newsletters", "#")):
+                    full_url = urljoin(TARGET_URL, href).split("?")[0]
+                    title = a.get_text(strip=True)
+
+                    if title and len(title.split()) >= 4:
+                        if not any(item["url"] == full_url for item in articles):
+                            articles.append({"title": title, "url": full_url})
+    except Exception as e:
+        print(f"Webpage fetch warning: {e}")
+    return articles
+
+def get_latest_politics_news():
+    rss_articles = fetch_from_rss()
+    web_articles = fetch_from_webpage()
+
+    combined = []
+    seen = set()
+
+    for item in rss_articles + web_articles:
+        if item["url"] not in seen:
+            seen.add(item["url"])
+            combined.append(item)
+
+    return combined
 
 def main():
     if not BOT_TOKEN or not CHAT_ID:
@@ -83,29 +136,36 @@ def main():
         return
 
     history = load_history()
-    articles = scrape_axios_politics()
-    print(f"Found {len(articles)} total articles on page.")
+    articles = get_latest_politics_news()
+    print(f"Total articles retrieved: {len(articles)}")
 
-    # Filter out already posted articles
     new_articles = [a for a in articles if a["url"] not in history]
-    print(f"New articles to post: {len(new_articles)}")
+    print(f"New recent articles to post: {len(new_articles)}")
 
-    # If first run with empty history, post the 3 most recent to avoid flood
+    # On first run, post only the 3 latest to prevent channel spam
     if not history and len(new_articles) > 3:
         new_articles = new_articles[:3]
 
-    # Post from oldest to newest
+    # Post from oldest to newest among new arrivals
     for article in reversed(new_articles):
+        # Translate headline to Persian
+        persian_title = translate_to_persian(article['title'])
+        safe_persian_title = html.escape(persian_title)
+
+        # Build formatted Telegram message
         message = (
-            f"🏛️ <b>{article['title']}</b>\n\n"
-            f"🔗 <a href='{article['url']}'>Read on Axios</a>"
+            f"⚡️ <b>{safe_persian_title}</b>\n\n"
+            f"<a href=\"{article['url']}\">🧿 اکـســـیــوس 🧿</a>\n\n"
+            f"🤖 @secretollah\n"
+            f"#axios"
         )
+
         send_telegram_message(message)
         history.append(article["url"])
-        time.sleep(2)  # Avoid rate limits
+        time.sleep(2)
 
     save_history(history)
-    print("Execution complete.")
+    print("Completed successfully.")
 
 if __name__ == "__main__":
     main()
